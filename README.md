@@ -27,3 +27,18 @@ python test.py
 ```
 
 Model is set via the `model` variable in `test.py`. Results are logged to `./logs`.
+
+## Acknowledgements & Original Sources
+
+This project integrates code and concepts from the following open-source repositories. We are grateful to their authors and maintainers for their foundational work.
+
+1.  **[UK Government BEIS - Inspect Evals](https://github.com/UKGovernmentBEIS/inspect_evals.git)**
+    The primary source for evaluation frameworks and methodologies used in this project.
+
+2.  **[Google Research - Camel Prompt Injection](https://github.com/google-research/camel-prompt-injection.git)**
+    Provides critical insights and datasets related to prompt injection vulnerabilities and robustness testing.
+
+3.  **[Microsoft - Fides](https://github.com/microsoft/fides.git)**
+    Serves as a key reference for privacy engineering and ethical data handling practices.
+
+We do not claim ownership of these external resources. All rights and credits belong to their respective owners.
