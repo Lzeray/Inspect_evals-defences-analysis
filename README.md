@@ -1,29 +1,29 @@
-# Исследование защиты от prompt injection: CaMeL + Inspect AI
+# Prompt Injection Defense Research: CaMeL + Inspect AI
 
-## Описание проекта
+## Overview
 
-Реализация и тестирование защиты **CaMeL** (от библиотеки `camel-prompt-injection`) от атак prompt injection на LLM-агентов, интегрированной в фреймворк **Inspect AI** с использованием бенчмарка **AgentDojo**.
+Implementation and testing of the **CaMeL** defense (from the `camel-prompt-injection` library) against prompt injection attacks on LLM agents, integrated into the **Inspect AI** framework using the **AgentDojo** benchmark.
 
-## Что сделано
+## What was done
 
-- **Интеграция CaMeL с Inspect AI** — создан `defences.py` с кастомным solver, который оборачивает пайплайн CaMeL как Inspect solver и конвертирует сообщения между форматами AgentDojo и Inspect AI.
-- **Написание тестового скрипта** — `test.py` запускает оценку на бенчмарке AgentDojo (workspace, selected user/injection tasks) с моделью `google/gemini-3.1-flash-lite`, используя CaMeL defense.
-- **Утилита конвертации** — `analyse_tools.py` реализует двустороннюю конвертацию сообщений (`agent_dojo_to_inspect_ai`, `inspect_ai_to_agent_dojo`) и поддержку моделей Google/OpenAI/Anthropic.
+- **CaMeL + Inspect AI integration** — `defences.py` wraps the CaMeL pipeline as an Inspect solver and converts messages between AgentDojo and Inspect AI formats.
+- **Test script** — `test.py` runs evaluation on the AgentDojo benchmark (workspace, selected user/injection tasks) with `google/gemini-3.1-flash-lite` model using CaMeL defense.
+- **Conversion utility** — `analyse_tools.py` implements bidirectional message conversion (`agent_dojo_to_inspect_ai`, `inspect_ai_to_agent_dojo`) and supports Google/OpenAI/Anthropic models.
 
-## Структура
+## Structure
 
 ```
-test.py              — точка входа, запуск eval
-defences.py          — CaMeL solver для Inspect AI
-analyse_tools.py     — конвертер сообщений между AgentDojo и Inspect AI
-camel-prompt-injection/ — библиотека CaMeL (внешняя зависимость)
+test.py              — entry point, runs eval
+defences.py          — CaMeL solver for Inspect AI
+analyse_tools.py     — message converter between AgentDojo and Inspect AI
+camel-prompt-injection/ — CaMeL library (external dependency)
 ```
 
-## Запуск
+## Usage
 
 ```bash
 source .venv/bin/activate
 python test.py
 ```
 
-Модель задаётся переменной `model` в `test.py`. Результаты логируются в `./logs`.
+Model is set via the `model` variable in `test.py`. Results are logged to `./logs`.
