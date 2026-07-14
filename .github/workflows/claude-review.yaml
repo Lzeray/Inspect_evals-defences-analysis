@@ -579,7 +579,7 @@ jobs:
       - name: Run Code Review with Claude
         if: steps.gate.outputs.proceed == 'true'
         id: claude-code
-        uses: anthropics/claude-code-action@80b31826338489861333dc17217865dfe8085cdc # v1.0.155
+        uses: anthropics/claude-code-action@f1bd27ca5b54584506e40e17884d90bdaaa1a9b3 # v1.0.173
         with:
           use_bedrock: true
           github_token: ${{ secrets.GITHUB_TOKEN }}

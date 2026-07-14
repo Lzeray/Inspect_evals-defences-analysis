@@ -163,7 +163,7 @@ jobs:
 
       - name: Run Claude Code to solve issue
         if: steps.validate.outputs.skip != 'true'
-        uses: anthropics/claude-code-action@80b31826338489861333dc17217865dfe8085cdc # v1.0.155
+        uses: anthropics/claude-code-action@f1bd27ca5b54584506e40e17884d90bdaaa1a9b3 # v1.0.173
         with:
           use_bedrock: true
           github_token: ${{ steps.app-token.outputs.token }}
@@ -498,7 +498,7 @@ jobs:
 
       - name: Run Claude Code to address PR comment
         if: steps.validate.outputs.skip != 'true'
-        uses: anthropics/claude-code-action@80b31826338489861333dc17217865dfe8085cdc # v1.0.155
+        uses: anthropics/claude-code-action@f1bd27ca5b54584506e40e17884d90bdaaa1a9b3 # v1.0.173
         with:
           use_bedrock: true
           github_token: ${{ steps.app-token.outputs.token }}
