@@ -1,0 +1,69 @@
+name: Suggest a Benchmark Registration
+description: Propose linking new benchmark to the Inspect Evals register.
+title: "[Benchmark Request] <Benchmark Name>"
+labels:
+  - implementation
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for proposing a new benchmark for the Inspect Evals register! Please fill out the details below.
+  - type: markdown
+    attributes:
+      value: >
+        _Note: Inspect Evals no longer accepts code submissions directly for new benchmarks — the benefit of filing this issue is to signal demand for an eval to be implemented in the Inspect AI framework and/or published in our [register of evaluations](https://ukgovernmentbeis.github.io/inspect_evals/)._
+  - type: input
+    id: benchmark_name
+    attributes:
+      label: Benchmark name
+      description: The name of the benchmark.
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A short description of the proposed benchmark.
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source / Citation
+      description: Link to the paper or other source.
+    validations:
+      required: true
+  - type: input
+    id: reference_implementation
+    attributes:
+      label: Reference Implementation / Code
+      description: Link to the reference implementation / source code, if available.
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use Case & Research Context
+      description: >
+        Do you plan to use this implementation in a research project, or do you know of a project / use case 
+        that this would likely be used for? Please provide details about the intended application.
+    validations:
+      required: true
+  - type: textarea
+    id: justification
+    attributes:
+      label: Justification for Inclusion
+      description: >
+        Is there any other useful context about why this evaluation should be included in the Inspect Evals register?
+        (e.g., fills a gap in existing evaluations, addresses important safety/capability concerns, 
+        widely used in the community, etc.)
+    validations:
+      required: true
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other background or context reviewers should know.
+  - type: markdown
+    attributes:
+      value: >
+        Someone from the maintainers' team will review and follow up soon. Thanks!

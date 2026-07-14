@@ -1,0 +1,53 @@
+name: PR Template Check
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+    branches:
+      - main
+      - "release/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# SECURITY: No checkout, no API calls; reads PR body via env only.
+# zizmor: excessive-permissions (https://docs.zizmor.sh/audits/#excessive-permissions)
+permissions: {}
+
+jobs:
+  check-pr-template:
+    name: Check PR template
+    if: github.actor != 'dependabot[bot]' && github.actor != 'github-actions[bot]' # skip this if the PR is automatically opened as part of workflows.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body includes template checklist
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Each required checklist item (substring that must appear in the PR body)
+          required_items=(
+            "Does this change affect existing eval(s)?"
+            "Is this change consequential to users?"
+          )
+
+          missing=()
+          for item in "${required_items[@]}"; do
+            if [[ "$PR_BODY" != *"$item"* ]]; then
+              missing+=("$item")
+            fi
+          done
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::PR body is missing required checklist items from the PR template."
+            echo ""
+            echo "Missing items:"
+            for item in "${missing[@]}"; do
+              echo "  - $item"
+            done
+            echo ""
+            echo "Please include the checklist from .github/PULL_REQUEST_TEMPLATE.md in your PR description."
+            exit 1
+          fi
+
+          echo "PR body contains all required checklist items."

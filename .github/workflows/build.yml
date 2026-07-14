@@ -1,0 +1,101 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    # The dispatch token (INSPECT_EVALS_DISPATCH_TOKEN) is a secret, so this must
+    # use pull_request_target — secrets are withheld from fork `pull_request` runs.
+    # That is safe here because this workflow never checks out or executes PR code;
+    # it only forwards the PR head SHA. The *downstream* workflow runs that untrusted
+    # code, so fork PRs are gated behind an "ok to test" label that a maintainer
+    # applies after reviewing the diff. The label is auto-revoked on every new commit
+    # (synchronize), so each new commit must be re-reviewed and re-labelled.
+    types: [opened, reopened, synchronize, labeled]
+    branches:
+      - main
+      - "release/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# SECURITY: trigger-tests uses a dedicated PAT (INSPECT_EVALS_DISPATCH_TOKEN) and no
+# GITHUB_TOKEN, so permissions default to none; the revoke-ok-to-test-label job opts
+# into pull-requests:write only.
+# zizmor: excessive-permissions (https://docs.zizmor.sh/audits/#excessive-permissions)
+permissions: {}
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  trigger-tests:
+    name: Trigger external tests
+    # Trusted events (push to main, manual dispatch) and same-repo (non-fork) PRs
+    # always run. Fork PRs run untrusted code downstream, so they only dispatch
+    # when a maintainer has just applied the "ok to test" label to the reviewed
+    # commit. A fork `synchronize` does NOT dispatch — it only revokes the label
+    # (below), forcing re-review of the new commit.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      github.event.pull_request.head.repo.fork == false ||
+      (github.event.action == 'labeled' && github.event.label.name == 'ok to test')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger tests in inspect-evals-actions
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.INSPECT_EVALS_DISPATCH_TOKEN }}
+          # Heavy test jobs (multi-OS, multi-Python, 8-core runners) are run in
+          # https://github.com/ArcadiaImpact/inspect-evals-actions due to GH
+          # runner requirements. Fast checks (linting, type checking, etc.) run
+          # locally in checks.yml and lint-new-evals.yml.
+          repository: ArcadiaImpact/inspect-evals-actions
+          event-type: build
+          client-payload: |-
+            {
+              "ref": "${{ github.event.pull_request.head.sha || github.sha }}",
+              "base_sha": "${{ github.event.pull_request.base.sha || '' }}",
+              "pr_number": "${{ github.event.pull_request.number }}",
+              "pr_title": ${{ toJSON(github.event.pull_request.title) }},
+              "is_pr": "${{ github.event_name == 'pull_request_target' }}",
+              "source_repo": "${{ github.repository }}"
+            }
+
+  revoke-ok-to-test-label:
+    name: Revoke "ok to test" on new commits
+    # When a fork PR receives a new commit, drop the "ok to test" label so the
+    # new code cannot be dispatched until a maintainer reviews it and re-applies
+    # the label. Closes the TOCTOU gap where a benign PR is approved, then
+    # amended with malicious code.
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # Required to remove the label
+    steps:
+      - name: Remove "ok to test" label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Best-effort revoke. Tolerate 404 (label wasn't applied) but fail
+          # loudly on real errors (e.g. missing pull-requests:write permission).
+          # gh api in an `if` condition is exempt from `set -e`; branching on its
+          # own stderr avoids parsing the HTTP status line.
+          if gh api --method DELETE \
+               "repos/${REPO}/issues/${PR_NUMBER}/labels/ok%20to%20test" \
+               --silent 2>/tmp/gh-err; then
+            echo "Revoked 'ok to test'; new commit must be re-reviewed."
+          elif grep -q "HTTP 404" /tmp/gh-err; then
+            echo "No 'ok to test' label to revoke."
+          else
+            echo "Failed to remove label:" >&2
+            cat /tmp/gh-err >&2
+            exit 1
+          fi

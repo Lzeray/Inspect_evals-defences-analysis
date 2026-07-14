@@ -1,0 +1,174 @@
+import argparse
+import logging
+import shutil
+from pathlib import Path
+
+from platformdirs import user_cache_dir
+
+from inspect_evals.constants import INSPECT_EVALS_CACHE_PATH
+
+CACHE_DIR = Path(user_cache_dir())
+PATH_TO_HF_CACHE = CACHE_DIR / "huggingface" / "datasets"
+PATH_TO_INSPECT_AI_CACHE = CACHE_DIR / "inspect_ai" / "hf_datasets"
+
+# Paths `make clean` must never delete.
+#
+# mle_bench's TOS-acceptance record is a small per-user JSON (kilobytes) that
+# is expensive to rebuild: each competition requires a rate-limited Kaggle
+# API probe, totalling minutes per full run. It's a persistent configuration
+# record, not a reclaimable cache, so cleaning it is strictly harmful.
+PROTECTED_PATHS: frozenset[Path] = frozenset(
+    {INSPECT_EVALS_CACHE_PATH / "mle_bench" / "tos_accepted"}
+)
+
+# For formatting linebreaks
+N_CHARS = 100
+
+_BYTES_PER_GB = 1024**3
+
+logger = logging.getLogger(__name__)
+
+
+def _is_protected(path: Path) -> bool:
+    return path in PROTECTED_PATHS
+
+
+def _contains_protected(path: Path) -> bool:
+    """Whether ``path`` is an ancestor of any protected path."""
+    return any(path in p.parents for p in PROTECTED_PATHS)
+
+
+def _log_disk_usage(prefix: str = "") -> None:
+    """Log free/total GB on the volume containing the user cache directory."""
+    try:
+        total, _used, free = shutil.disk_usage(CACHE_DIR)
+    except OSError as e:
+        logger.warning(f"{prefix}Disk usage check failed: {e}")
+        return
+    logger.info(
+        f"{prefix}Disk: {free / _BYTES_PER_GB:.2f} GB free / "
+        f"{total / _BYTES_PER_GB:.2f} GB total"
+    )
+
+
+def delete_path_if_exists(path: Path, dry_run: bool) -> None:
+    """
+    Delete the given path if it exists.
+
+    If dry_run is True then just log the path that would
+    have been deleted but do not delete.
+    """
+    if dry_run:
+        logger.info(f"[DRY-RUN] Would delete {path}")
+        return
+
+    logger.info(f"Deleting {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    else:
+        raise ValueError(f"Could not find path: {path}")
+
+
+def rm_from_dir(
+    top_level_dir: Path, dry_run: bool, preserve_protected: bool = True
+) -> None:
+    if not top_level_dir.exists():
+        logger.debug(f"Directory {top_level_dir=} does not exist")
+        return None
+    logger.debug(f"Looking in dir: {[n.name for n in top_level_dir.iterdir()]}")
+    paths_to_rm = [path for path in top_level_dir.iterdir()]
+    logger.debug(f"Found paths to remove inside of: {top_level_dir}... {paths_to_rm}")
+    for path_to_rm in paths_to_rm:
+        if preserve_protected and _is_protected(path_to_rm):
+            logger.info(f"Skipping protected path: {path_to_rm}")
+            continue
+        if preserve_protected and _contains_protected(path_to_rm):
+            # A protected path lives inside this directory — descend and
+            # clean siblings rather than nuking the whole subtree.
+            logger.info(f"Descending into {path_to_rm} to preserve protected paths")
+            rm_from_dir(path_to_rm, dry_run, preserve_protected)
+            continue
+        delete_path_if_exists(path_to_rm, dry_run)
+
+
+def clean_cache(
+    path_to_cache: Path, dry_run: bool, preserve_protected: bool = True
+) -> None:
+    """Logging wrapper for convenience"""
+    line_delim_symbol = "="
+    info_prefix = "[DRY-RUN] Would delete" if dry_run else "Deleting"
+    logger.info(f"{info_prefix} data from cache: {path_to_cache}")
+    logger.info(line_delim_symbol * N_CHARS)
+    rm_from_dir(path_to_cache, dry_run, preserve_protected)
+    logger.info(line_delim_symbol * N_CHARS)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Clean build artifacts. Currently cleans huggingface (including non-inspect related artefacts) and inspect_evals caches."
+    )
+
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO"],
+        help="Set the logging level (default: INFO).",
+    )
+    # Better to explicitly pass no-dry-run than explicitly pass dry-run
+    parser.add_argument(
+        "--no-dry-run",
+        dest="no_dry_run",
+        default=False,
+        action="store_true",
+        help="Actually delete cache content. If this arg is not provided, defaults to showing what would be deleted but don't delete.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation for HuggingFace cache, and proceed with full cache cleaning",
+    )
+    parser.add_argument(
+        "--preserve-protected-paths",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Preserve paths in PROTECTED_PATHS (default: true). Pass "
+            "--no-preserve-protected-paths to nuke them too. Currently "
+            "protects mle_bench/tos_accepted/."
+        ),
+    )
+    args = parser.parse_args()
+    dry_run = not args.no_dry_run
+    preserve_protected = args.preserve_protected_paths
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    _log_disk_usage("Pre-clean ")
+    clean_cache(PATH_TO_INSPECT_AI_CACHE, dry_run, preserve_protected)
+    clean_cache(INSPECT_EVALS_CACHE_PATH, dry_run, preserve_protected)
+
+    # NOTE [hf-cache-cleaning-scope]:
+    # Building a classifier to distinguish artifacts relevant to inspect
+    # in the HuggingFace cache without risking false negatives (i.e. artifacts
+    # relevant to `inspect` that are mistakenly left behind) is difficult (not impossible).
+    # For simplicity, we instead clean the entire HuggingFace cache,
+    # including non-inspect-eval-related content.
+    if not args.force:
+        if not dry_run:
+            logger.warning(
+                "⚠️ You are about to clean the entire HuggingFace cache. This will also remove huggingface cache artifacts unrelated to inspect."
+            )
+        confirmation_result = input(
+            f"Proceed with full HuggingFace cache clean (dry_run={dry_run})? [y/N]: "
+        )
+        if confirmation_result.strip().lower() != "y":
+            logger.info("❌ HuggingFace cache clean aborted.")
+            return
+
+    clean_cache(PATH_TO_HF_CACHE, dry_run, preserve_protected)
+    _log_disk_usage("Post-clean ")
+    logger.info(f"✅ Done cleaning caches (With dry_run={dry_run})")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import platform
+import re
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
+
+import backoff
+
+from inspect_evals.metadata import (
+    ExternalEvalMetadata,
+    InternalEvalMetadata,
+    TaskMetadata,
+    load_listing,
+)
+
+if sys.version_info < (3, 11):
+    if not TYPE_CHECKING:
+        sys.exit("Requires Python 3.11 or higher (ExceptionGroup is used).")
+
+    class ExceptionGroup(Exception):
+        def __init__(self, message: str, exceptions: list[Exception]) -> None: ...
+
+
+logger = logging.getLogger(__name__)
+
+MISSING_MODULE_REASON = "ModuleNotFoundError"
+EVAL_TIMEOUT_MINS = 5
+DEFAULT_SAMPLE_LIMIT = 0
+DEFAULT_MODEL = None
+PLACEHOLDER_VALUE = "placeholder"
+# Transient sqlite errors occur when Inspect's internal log buffer database
+# fails to initialise under disk pressure or parallel execution. These are
+# infrastructure errors (not eval bugs), so we retry rather than fail.
+SQLITE_TRANSIENT_ERROR = "sqlite3.OperationalError: unable to open database file"
+MAX_SMOKE_TEST_RETRIES = 3
+
+TASK_SPECIFIC_ENV_VARS = {
+    "cybench": {"CYBENCH_ACKNOWLEDGE_RISKS": "1"},
+    "sandboxbench": {"SANDBOXBENCH_ACKNOWLEDGE_RISKS": "1"},
+}
+
+# TODO: These can be fixed
+KNOWN_FAILURES = {
+    "paperbench_score": "Nonstandard eval",
+}
+
+WINDOWS_HEAVY_EVAL_REASON = (
+    "Too resource-heavy for the Windows smoke runner; see entry comment."
+)
+
+WINDOWS_LINUX_DOCKER_REASON = (
+    "Requires a Linux Docker image; Windows GitHub runners use Windows-container "
+    "mode and cannot launch Linux images."
+)
+
+KNOWN_WINDOWS_ONLY_FAILURES = {
+    "swe_bench_verified_mini": MISSING_MODULE_REASON,
+    "swe_bench": MISSING_MODULE_REASON,
+    # The Windows smoke runner has run out of disk on every scheduled run
+    # since 2026-05-01, exiting with STATUS_ACCESS_VIOLATION (3221225477).
+    # Linux hits the 15-min eval-timeout before it would run out of disk.
+    # See https://github.com/UKGovernmentBEIS/inspect_evals/pull/1615.
+    "cybergym": WINDOWS_HEAVY_EVAL_REASON,
+    # cti_realm spins up a Linux Docker sandbox (python:3.11-slim). Windows
+    # GitHub runners run Docker in Windows-container mode and cannot launch
+    # Linux images, producing: image operating system "linux" cannot be used
+    # on this platform.
+    "cti_realm_25": WINDOWS_LINUX_DOCKER_REASON,
+    "cti_realm_50": WINDOWS_LINUX_DOCKER_REASON,
+    "cti_realm_25_minimal": WINDOWS_LINUX_DOCKER_REASON,
+    "cti_realm_25_seeded": WINDOWS_LINUX_DOCKER_REASON,
+}
+
+CI_ONLY_IGNORES: dict[str, str] = {}
+
+MISSING_CREDENTIALS_REASON = "Missing required credentials"
+
+
+def _has_kaggle_credentials() -> bool:
+    if os.environ.get("KAGGLE_KEY") and os.environ.get("KAGGLE_USERNAME"):
+        return True
+    return Path(os.path.expanduser("~/.kaggle/kaggle.json")).exists()
+
+
+MISSING_CREDENTIALS_SKIPS: dict[str, str] = {
+    **(
+        {
+            "mle_bench": MISSING_CREDENTIALS_REASON,
+            "mle_bench_lite": MISSING_CREDENTIALS_REASON,
+            "mle_bench_full": MISSING_CREDENTIALS_REASON,
+        }
+        if not _has_kaggle_credentials()
+        else {}
+    ),
+}
+
+
+# TODO: We want to make this as small as possible
+# Fixing known failures, improving CI test running
+# capability etc.
+SKIPPABLE_TASKS = {
+    **KNOWN_FAILURES,
+    **(KNOWN_WINDOWS_ONLY_FAILURES if platform.system() == "Windows" else {}),
+    **(CI_ONLY_IGNORES if os.environ.get("GITHUB_ACTIONS") else {}),
+    **MISSING_CREDENTIALS_SKIPS,
+}
+
+
+def get_evals(
+    predicate_regexp: str | None = None,
+) -> list[ExternalEvalMetadata | InternalEvalMetadata]:
+    evals = load_listing().evals
+
+    # External evals live in upstream repositories and cannot be smoke-tested
+    # locally — their task_path refers to files in the external repo, not this
+    # one.  Filter them out so the runner only exercises internal evals.
+    evals = [e for e in evals if not isinstance(e, ExternalEvalMetadata)]
+
+    if predicate_regexp is None:
+        return evals
+    pattern = re.compile(predicate_regexp)
+    return [
+        eval
+        for eval in evals
+        if pattern.search(eval.id)
+        or pattern.search(eval.path)
+        or any(pattern.search(task.name) for task in eval.tasks)
+    ]
+
+
+def handle_accepted_errors(
+    error: subprocess.CalledProcessError, task_name: str, descriptor: str
+) -> None:
+    logger.info(
+        f"Found error on {descriptor}: {error=}. Checking if error is accepted..."
+    )
+
+    if any(skippable_task == task_name for skippable_task in SKIPPABLE_TASKS):
+        logger.warning(
+            f"Skipping {descriptor}...reason: {SKIPPABLE_TASKS[task_name]}... "
+            f"Would get {error=}..."
+        )
+        return None
+
+    gated_dataset_error = (
+        "DatasetNotFoundError" in error.output
+        and "is a gated dataset on the Hub" in error.output
+    ) or "huggingface_hub.errors.GatedRepoError" in error.output
+
+    optional_dependency_missing_error = "require_optional_dependency" in error.output
+
+    ignore_error_string = (
+        f"Error on {descriptor} ({error=}) found to be "
+        f"{{IGNORE_ERROR_DETAIL}}... "
+        "ignoring"
+    )
+    accepted_errors = {
+        gated_dataset_error: ignore_error_string.format(
+            IGNORE_ERROR_DETAIL="gated dataset error"
+        ),
+        optional_dependency_missing_error: ignore_error_string.format(
+            IGNORE_ERROR_DETAIL="optional dependency error"
+        ),
+    }
+
+    for accepted_error, reason in accepted_errors.items():
+        if accepted_error:
+            logger.warning(reason)
+            return None
+
+    logger.warning(
+        f"Error on {descriptor} ({error=}) is not considered acceptable... "
+        f"{error.output=}"
+    )
+    raise error
+
+
+def _is_transient_subprocess_error(e: subprocess.CalledProcessError) -> bool:
+    """Check if a subprocess error is transient and should be retried."""
+    return SQLITE_TRANSIENT_ERROR in (e.output or "")
+
+
+def _is_retriable_error(e: Exception) -> bool:
+    """Decide whether backoff should give up (True = give up, False = retry)."""
+    if isinstance(e, subprocess.CalledProcessError):
+        return not _is_transient_subprocess_error(e)
+    return True
+
+
+@backoff.on_exception(
+    backoff.expo,
+    exception=subprocess.CalledProcessError,
+    giveup=_is_retriable_error,
+    max_tries=MAX_SMOKE_TEST_RETRIES,
+    jitter=backoff.full_jitter,
+)
+def _run_eval(run_eval_command: str, task_name: str, eval_timeout_mins: int) -> None:
+    subprocess.run(
+        run_eval_command,
+        shell=True,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={
+            **os.environ,
+            **TASK_SPECIFIC_ENV_VARS.get(task_name, {}),
+            **inject_placeholder_llm_keys(),
+            # More simple to just add gdm env vars
+            # into all tasks
+            **inject_gdm_placeholder_env_vars(),
+        },
+        timeout=eval_timeout_mins * 60,
+    )
+
+
+def smoke_test(
+    task_name: str,
+    task_ref: str,
+    descriptor: str,
+    eval_timeout_mins: int,
+    subprocess_semaphore: threading.BoundedSemaphore,
+    limit: int,
+    model: str | None,
+    package_path: str | None = None,
+) -> None:
+    """
+    Invoke eval task.
+
+    An eval task will either:
+
+    (1) Succeed cleanly
+    (2) Fail
+
+    Failures are partitioned by:
+
+    (1) Timeouts
+    (2) Acceptable errors (see: `handle_accepted_errors`)
+    (3) Transient errors that are retried (e.g. sqlite infrastructure errors)
+    (4) Unexpected errors (everything else)
+
+    Acceptable errors are partitioned by:
+
+    (1) Eval-specific errors marked to fail a-priori (see: `SKIPPABLE_TASKS`)
+    (2) Errors related to gated repos and dependencies
+    """
+    uv_prefix = f"uv run --directory {package_path}" if package_path else "uv run"
+    run_eval_command = f"""{uv_prefix} \
+    inspect eval {task_ref} \
+    --limit {limit} \
+    {f"--model {model}" if model else ""}"""
+
+    logger.info(f"Testing {descriptor}")
+
+    try:
+        with subprocess_semaphore:
+            _run_eval(run_eval_command, task_name, eval_timeout_mins)
+
+    except subprocess.CalledProcessError as e:
+        handle_accepted_errors(e, task_name, descriptor)
+        return None
+
+    except subprocess.TimeoutExpired as e:
+        logger.warning(f"Timed out: {descriptor} ({e}). {e.output=}")
+        return None
+
+    if task_name in SKIPPABLE_TASKS:
+        logger.warning(
+            f"Task {task_name=} is in SKIPPABLE_TASKS, but should be removed due to running successfully."
+        )
+
+    logger.info(f"Succeeded: {descriptor}")
+    return None
+
+
+def run_eval_job(
+    eval_meta: ExternalEvalMetadata | InternalEvalMetadata,
+    eval_index: int,
+    eval_timeout_mins: int,
+    within_eval_concurrency: bool,
+    subprocess_semaphore: threading.BoundedSemaphore,
+    limit: int,
+    model: str | None,
+) -> None:
+    """Run one eval's tasks, serially or in parallel per ``within_eval_concurrency``."""
+    total = len(eval_meta.tasks)
+
+    package_path = (
+        eval_meta.package_path if isinstance(eval_meta, InternalEvalMetadata) else None
+    )
+
+    def _task_ref(task: TaskMetadata) -> str:
+        # Registry entries run via file-path (upstream's task file); internal
+        # evals use the entry-point prefix exposed by the installed package.
+        if isinstance(eval_meta, ExternalEvalMetadata):
+            return f"{task.task_path}@{task.name}"
+        return f"inspect_evals/{task.name}"
+
+    invocations = [
+        (
+            task.name,
+            _task_ref(task),
+            (
+                f"eval {eval_index} ({eval_meta.id}) "
+                f"task {task_index + 1} of {total} ({task.name})"
+            ),
+            eval_timeout_mins,
+            subprocess_semaphore,
+            limit,
+            model,
+            package_path,
+        )
+        for task_index, task in enumerate(eval_meta.tasks)
+    ]
+    workers = total if within_eval_concurrency else 1
+    with ThreadPoolExecutor(max_workers=workers) as exec:
+        futures = [exec.submit(smoke_test, *args) for args in invocations]
+        for f in as_completed(futures):
+            f.result()
+
+
+def run_evals(
+    evals: list[ExternalEvalMetadata | InternalEvalMetadata],
+    exec: ThreadPoolExecutor,
+    eval_start_index: int,
+    eval_timeout_mins: int,
+    fail_fast: bool,
+    within_eval_concurrency: bool,
+    subprocess_semaphore: threading.BoundedSemaphore,
+    limit: int,
+    model: str | None,
+) -> None:
+    tasks = [
+        exec.submit(
+            run_eval_job,
+            e,
+            eval_start_index + i,
+            eval_timeout_mins,
+            within_eval_concurrency,
+            subprocess_semaphore,
+            limit,
+            model,
+        )
+        for i, e in enumerate(evals)
+    ]
+    try:
+        for task in as_completed(tasks):
+            task.result()
+    except subprocess.CalledProcessError as final_error:
+        logger.warning("Found unexpected error (stdout + stderr)")
+        for line in final_error.output.splitlines():
+            logger.info(line)
+        if fail_fast:
+            logger.warning("Cancelling the remaining scheduled tasks")
+            for task in tasks:
+                task.cancel()
+        raise
+
+
+def inject_placeholder_llm_keys() -> dict[str, str]:
+    keys = [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GOOGLE_API_KEY",
+        "SPOONACULAR_API_KEY",
+        "AICROWD_API_KEY",
+        "KAGGLE_KEY",
+        "KAGGLE_USERNAME",
+    ]
+    return {key: PLACEHOLDER_VALUE for key in keys if key not in os.environ}
+
+
+def inject_gdm_placeholder_env_vars() -> dict[str, str]:
+    return {
+        "EMPLOYEE_NAME": PLACEHOLDER_VALUE,
+        "GDM_SELF_PROLIFERATION_DEV": PLACEHOLDER_VALUE,
+        "PROJECT_ID": PLACEHOLDER_VALUE,
+        "EMPLOYEE_WEBSITE": PLACEHOLDER_VALUE,
+        "EMAIL_ADDRESS": PLACEHOLDER_VALUE,
+    }
+
+
+T = TypeVar("T")
+
+
+def chunks(lst: list[T], n: int) -> list[list[T]]:
+    return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+
+def clean() -> None:
+    logger.info("Cleaning disk")
+    # Inherit parent stdout/stderr so `make clean`'s own output (including
+    # pre/post disk usage from tools/clean.py) surfaces to the smoke-test log.
+    subprocess.run(
+        "make clean DRY_RUN=false CLEAN_ARGS=--force",
+        shell=True,
+        check=True,
+        text=True,
+    )
+    logger.info("Cache cleaning complete")
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.limit > 0 and args.model is None:
+        raise ValueError(
+            "--model must be provided when --limit > 0. "
+            f"Found {args.model=}, {args.limit=}"
+        )
+
+
+def resolve_max_threads(n_threads: int | None) -> int:
+    # Evals are I/O bound
+    if n_threads is not None:
+        return n_threads
+
+    if (n_cpu := os.cpu_count()) is None:
+        return 1
+
+    return max(1, n_cpu // 2)
+
+
+def smoke_test_all_evals() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pred",
+        type=str,
+        default=None,
+        help="Filter for a subset of inspect evals tasks.",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action=argparse.BooleanOptionalAction,
+        help="Raise on the first unexpected exception.",
+        default=True,
+    )
+    parser.add_argument(
+        "--eval-timeout-mins",
+        type=int,
+        help="The amount of time to have the eval run for until a timeout warning is logged.",
+        default=EVAL_TIMEOUT_MINS,
+    )
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        help="Show debug logs",
+        default=False,
+    )
+    parser.add_argument(
+        "--clean-after-chunk",
+        action=argparse.BooleanOptionalAction,
+        help="Purge caches with `make clean` after each chunk",
+        default=False,
+    )
+    parser.add_argument(
+        "--within-eval-concurrency",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Run tasks of the same eval in parallel. Default is serial: "
+            "prevents races over shared state during Python imports "
+            "(e.g. Kaggle config dir creation)."
+        ),
+        default=False,
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Number of samples to run the eval for.",
+        default=DEFAULT_SAMPLE_LIMIT,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Model to run the eval for.",
+        default=DEFAULT_MODEL,
+    )
+    parser.add_argument("--n-threads", type=int, help="Number of threads", default=None)
+    args = parser.parse_args()
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    validate_args(args)
+
+    max_threads = resolve_max_threads(args.n_threads)
+    evals = get_evals(args.pred)
+    n_evals = len(evals)
+    n_tasks = sum(len(e.tasks) for e in evals)
+    eval_chunks = chunks(evals, max_threads)
+    logger.info(
+        f"Testing {n_evals} evals ({n_tasks} tasks) in {len(eval_chunks)} chunk(s) "
+        f"with {max_threads=}"
+    )
+
+    errors = []
+    for i, chunk in enumerate(eval_chunks):
+        logger.info(f"Running chunk {i + 1}/{len(eval_chunks)} ({len(chunk)} evals)")
+        try:
+            with ThreadPoolExecutor(max_workers=max_threads) as exec:
+                run_evals(
+                    chunk,
+                    exec=exec,
+                    eval_start_index=i * max_threads,
+                    eval_timeout_mins=args.eval_timeout_mins,
+                    fail_fast=args.fail_fast,
+                    within_eval_concurrency=args.within_eval_concurrency,
+                    subprocess_semaphore=threading.BoundedSemaphore(max_threads),
+                    limit=args.limit,
+                    model=args.model,
+                )
+        except Exception as e:
+            logger.exception(f"At least one eval in chunk {i + 1} failed")
+            if args.fail_fast:
+                raise
+            errors.append(e)
+        finally:
+            if args.clean_after_chunk:
+                clean()
+
+    if errors:
+        raise ExceptionGroup(f"{len(errors)} chunk(s) failed", errors)
+
+    logger.info(f"Successfully ran {n_evals} without any unexpected errors")
+
+
+if __name__ == "__main__":
+    if not os.getenv("HF_TOKEN"):
+        raise ValueError(
+            "Requires a nonempty HF_TOKEN to get reasonable rate limiting policy."
+        )
+    smoke_test_all_evals()
